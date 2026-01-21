@@ -27,18 +27,16 @@ Manage multiple Docker containers (hundreds of them, if you want) with SSH acces
    sudo apt install python3-docker
    ```
 
-3. Build the base image (you need docker & docker compose installed):
+3. Build the base image:
 
    ```bash
    # Build bootstrap image
    docker build --no-cache -t cm-bootstrap:latest -f Dockerfile.base .
 
-   # Run interactively to make changes if desired
-   docker run -it --user me --name cm-auth cm-bootstrap:latest /bin/bash
-
-   # Commit container as base image
-   docker commit cm-auth cm-base:latest
-   docker rm cm-auth
+   # Run interactively to make modifications
+   docker run -it --user me --name cm-mod cm-bootstrap:latest /bin/bash
+   docker commit cm-mod cm-base:latest
+   docker rm cm-mod
    ```
 
 4. Build runtime image:
