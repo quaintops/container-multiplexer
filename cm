@@ -1,0 +1,929 @@
+#!/usr/bin/env python3
+"""CM - Multi-instance Docker environment manager."""
+
+import argparse
+import subprocess
+import sys
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import docker
+from docker.errors import NotFound, APIError
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+BASE_PORT = 2200
+IMAGE_NAME = "cm"
+WORKSPACES_DIR = SCRIPT_DIR / "workspaces"
+
+# Ensure workspaces directory exists (handles symlink-to-nonexistent case)
+if WORKSPACES_DIR.is_symlink():
+    # Resolve symlink and create target directory
+    Path(os.readlink(WORKSPACES_DIR)).mkdir(exist_ok=True)
+else:
+    WORKSPACES_DIR.mkdir(exist_ok=True)
+
+
+def run_tmux(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Run a tmux command, printing it to stderr first."""
+    cmd = ["tmux"] + args
+    print(f"+ {' '.join(cmd)}", file=sys.stderr)
+    return subprocess.run(cmd, **kwargs)
+
+
+def exec_tmux(args: list[str]) -> None:
+    """Replace current process with tmux command, printing it to stderr first."""
+    cmd = ["tmux"] + args
+    print(f"+ {' '.join(cmd)}", file=sys.stderr)
+    os.execlp("tmux", *cmd)
+
+
+def get_client() -> docker.DockerClient:
+    """Get Docker client."""
+    return docker.from_env()
+
+
+def get_instance_config(n: int) -> dict:
+    """Get configuration for instance N."""
+    return {
+        "container": f"cm-{n:03d}",
+        "port": BASE_PORT + n,
+        "workspace": WORKSPACES_DIR / f"cm.{n:03d}",
+    }
+
+
+def get_container(client: docker.DockerClient, name: str):
+    """Get a container by name, or None if not found."""
+    try:
+        return client.containers.get(name)
+    except NotFound:
+        return None
+
+
+def parse_instances(args: list[str]) -> list[int]:
+    """Parse instance arguments into a list of instance numbers.
+
+    Supports:
+        - Single numbers: 1 2 3
+        - Ranges: 1-5
+        - Mixed: 1 3-5 7
+        - 'all' keyword for stop command
+    """
+    instances = []
+    for arg in args:
+        if "-" in arg and arg != "all":
+            try:
+                start, end = arg.split("-")
+                start, end = int(start), int(end)
+                if start > end:
+                    start, end = end, start
+                instances.extend(range(start, end + 1))
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"Invalid range: {arg}")
+        else:
+            try:
+                instances.append(int(arg))
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"Invalid instance: {arg}")
+
+    # Validate all instances are positive
+    for n in instances:
+        if n < 1:
+            raise argparse.ArgumentTypeError(f"Instance {n} must be positive")
+
+    return sorted(set(instances))
+
+
+def get_running_instances(client: docker.DockerClient) -> list[int]:
+    """Get list of running instance numbers."""
+    containers = client.api.containers(
+        filters={"name": "cm-", "status": "running"}
+    )
+    instances = []
+    for c in containers:
+        names = c.get("Names", [])
+        if not names:
+            continue
+        name = names[0].lstrip("/")
+        if name.startswith("cm-"):
+            try:
+                n = int(name.split("-")[1])
+                instances.append(n)
+            except (IndexError, ValueError):
+                continue
+    return sorted(instances)
+
+
+def get_next_session_name() -> tuple[str, bool]:
+    """Get next available tmux session name.
+
+    Returns (session_name, existed) where existed is True if a cm session
+    already existed and we're creating a new one.
+    """
+    n = 1
+    existed = False
+    while True:
+        name = f"cm-s{n}"
+        result = run_tmux(["has-session", "-t", name],
+                                capture_output=True)
+        if result.returncode != 0:
+            return name, existed
+        existed = True
+        n += 1
+
+
+def try_start_container(client: docker.DockerClient, n: int, cfg: dict) -> tuple[int | None, str | None]:
+    """Try to start a container, retrying with next port if port is in use.
+
+    Returns (port, None) on success, or (None, error_message) on failure.
+    """
+    port = cfg["port"]
+    max_port_attempts = 100
+
+    for attempt in range(max_port_attempts):
+        try:
+            client.containers.run(
+                IMAGE_NAME,
+                detach=True,
+                name=cfg["container"],
+                hostname=cfg["container"],
+                ports={"22/tcp": port},
+                volumes={
+                    str(SCRIPT_DIR / "authorized_keys"): {
+                        "bind": "/home/me/.ssh/authorized_keys",
+                        "mode": "ro",
+                    },
+                    str(cfg["workspace"]): {
+                        "bind": "/home/me/workspace",
+                        "mode": "rw",
+                    },
+                },
+                restart_policy={"Name": "unless-stopped"},
+            )
+            return (port, None)
+        except APIError as e:
+            if "port is already allocated" in str(e):
+                # Remove the failed container before retrying with new port
+                container = get_container(client, cfg["container"])
+                if container:
+                    container.remove(force=True)
+                port += 1
+                continue
+            return (None, str(e))
+
+    return (None, f"Could not find available port after {max_port_attempts} attempts")
+
+
+def start_instance(client: docker.DockerClient, n: int) -> bool:
+    """Start a single instance. Returns True on success."""
+    cfg = get_instance_config(n)
+
+    # Create workspace if needed
+    cfg["workspace"].mkdir(parents=True, exist_ok=True)
+
+    # Check if already running
+    container = get_container(client, cfg["container"])
+    if container:
+        if container.status == "running":
+            print(f"Instance {n} is already running")
+            return True
+        # Remove stopped container
+        container.remove()
+
+    # Check if image exists
+    try:
+        client.images.get(IMAGE_NAME)
+    except NotFound:
+        print(f"Image '{IMAGE_NAME}' not found. Build it first:")
+        print(f"  docker build -t {IMAGE_NAME} .")
+        return False
+
+    # Start container
+    port, error = try_start_container(client, n, cfg)
+    if error:
+        print(f"Failed to start instance {n}: {error}")
+        return False
+
+    if port != cfg["port"]:
+        print(f"Started instance {n} (port {port} - {cfg['port']} was in use, workspace {cfg['workspace'].name}/)")
+    else:
+        print(f"Started instance {n} (port {port}, workspace {cfg['workspace'].name}/)")
+    return True
+
+
+def stop_instance(client: docker.DockerClient, n: int) -> bool:
+    """Stop a single instance. Returns True on success."""
+    cfg = get_instance_config(n)
+
+    container = get_container(client, cfg["container"])
+    if not container:
+        print(f"Instance {n} does not exist")
+        return False
+
+    container.stop()
+    container.remove()
+    print(f"Stopped instance {n}")
+    return True
+
+
+def restart_instance(client: docker.DockerClient, n: int) -> bool:
+    """Restart a single instance. Returns True on success."""
+    cfg = get_instance_config(n)
+
+    container = get_container(client, cfg["container"])
+    if container:
+        container.stop()
+        container.remove()
+
+    return start_instance(client, n)
+
+
+def _start_instance_worker(n: int) -> tuple[int, bool, str]:
+    """Worker function to start an instance in a thread."""
+    client = docker.from_env()
+    try:
+        cfg = get_instance_config(n)
+        cfg["workspace"].mkdir(parents=True, exist_ok=True)
+
+        container = get_container(client, cfg["container"])
+        if container:
+            if container.status == "running":
+                return (n, True, f"Instance {n} is already running")
+            container.remove()
+
+        try:
+            client.images.get(IMAGE_NAME)
+        except NotFound:
+            return (n, False, f"Image '{IMAGE_NAME}' not found")
+
+        port, error = try_start_container(client, n, cfg)
+        if error:
+            return (n, False, f"Failed to start instance {n}: {error}")
+
+        if port != cfg["port"]:
+            return (n, True, f"Started instance {n} (port {port} - {cfg['port']} was in use, workspace {cfg['workspace'].name}/)")
+        return (n, True, f"Started instance {n} (port {port}, workspace {cfg['workspace'].name}/)")
+    finally:
+        client.close()
+
+
+def _stop_instance_worker(n: int) -> tuple[int, bool, str]:
+    """Worker function to stop an instance in a thread."""
+    client = docker.from_env()
+    try:
+        cfg = get_instance_config(n)
+        container = get_container(client, cfg["container"])
+        if not container:
+            return (n, False, f"Instance {n} does not exist")
+        container.stop()
+        container.remove()
+        return (n, True, f"Stopped instance {n}")
+    finally:
+        client.close()
+
+
+def _restart_instance_worker(n: int) -> tuple[int, bool, str]:
+    """Worker function to restart an instance in a thread."""
+    client = docker.from_env()
+    try:
+        cfg = get_instance_config(n)
+        container = get_container(client, cfg["container"])
+        if container:
+            container.stop()
+            container.remove()
+
+        cfg["workspace"].mkdir(parents=True, exist_ok=True)
+
+        try:
+            client.images.get(IMAGE_NAME)
+        except NotFound:
+            return (n, False, f"Image '{IMAGE_NAME}' not found")
+
+        port, error = try_start_container(client, n, cfg)
+        if error:
+            return (n, False, f"Failed to restart instance {n}: {error}")
+
+        if port != cfg["port"]:
+            return (n, True, f"Restarted instance {n} (port {port} - {cfg['port']} was in use, workspace {cfg['workspace'].name}/)")
+        return (n, True, f"Restarted instance {n} (port {port}, workspace {cfg['workspace'].name}/)")
+    finally:
+        client.close()
+
+
+def run_parallel(worker_func, instances: list[int]) -> bool:
+    """Run worker function in parallel across instances.
+    Returns True if all operations succeeded.
+    """
+    all_success = True
+    with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+        future_to_n = {executor.submit(worker_func, n): n for n in instances}
+        for future in as_completed(future_to_n):
+            try:
+                _, success, message = future.result()
+                print(message)
+                if not success:
+                    all_success = False
+            except Exception as e:
+                n = future_to_n[future]
+                print(f"Instance {n}: unexpected error: {e}")
+                all_success = False
+
+    return all_success
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    """Start instances."""
+    instances = parse_instances(args.instances)
+
+    if not instances:
+        print("No instances specified")
+        return 1
+
+    if len(instances) > 1:
+        success = run_parallel(_start_instance_worker, instances)
+    else:
+        client = get_client()
+        success = start_instance(client, instances[0])
+    return 0 if success else 1
+
+
+def cmd_restart(args: argparse.Namespace) -> int:
+    """Restart instances."""
+    if args.instances == ["all"]:
+        client = get_client()
+        instances = get_running_instances(client)
+        if not instances:
+            print("No running instances to restart")
+            return 0
+    else:
+        instances = parse_instances(args.instances)
+
+    if not instances:
+        print("No instances specified")
+        return 1
+
+    if len(instances) > 1:
+        success = run_parallel(_restart_instance_worker, instances)
+    else:
+        client = get_client()
+        success = restart_instance(client, instances[0])
+    return 0 if success else 1
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    """Stop instances."""
+    if args.instances == ["all"]:
+        client = get_client()
+        instances = get_running_instances(client)
+        if not instances:
+            print("No running instances to stop")
+            return 0
+    else:
+        instances = parse_instances(args.instances)
+
+    if not instances:
+        print("No instances specified")
+        return 1
+
+    if len(instances) > 1:
+        success = run_parallel(_stop_instance_worker, instances)
+    else:
+        client = get_client()
+        success = stop_instance(client, instances[0])
+    return 0 if success else 1
+
+
+def cmd_ssh(args: argparse.Namespace) -> int:
+    """SSH into an instance."""
+    client = get_client()
+    cfg = get_instance_config(args.instance)
+
+    container = get_container(client, cfg["container"])
+    if not container or container.status != "running":
+        print(f"Instance {args.instance} is not running")
+        return 1
+
+    os.execlp("ssh", "ssh",
+              "-o", "StrictHostKeyChecking=no",
+              "-o", "UserKnownHostsFile=/dev/null",
+              "-p", str(cfg["port"]),
+              "cm")
+
+
+def parse_status(status_str: str) -> tuple[str, str]:
+    """Extract uptime and health from Docker status string.
+
+    Docker status looks like "Up 2 hours" or "Up 2 hours (healthy)".
+    Returns (uptime, health) tuple.
+    """
+    if not status_str or not status_str.startswith("Up "):
+        return ("-", "-")
+
+    # Remove "Up " prefix
+    rest = status_str[3:]
+
+    # Check for health status suffix
+    if " (" in rest:
+        uptime, health_part = rest.split(" (", 1)
+        health = health_part.rstrip(")")
+    else:
+        uptime = rest
+        health = "-"
+
+    return (uptime, health)
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """List all CM instances."""
+    client = get_client()
+
+    # Low-level API returns lightweight dicts
+    containers = client.api.containers(all=True, filters={"name": "cm-"})
+
+    instances = []
+    for c in containers:
+        names = c.get("Names", [])
+        if not names:
+            continue
+        name = names[0].lstrip("/")
+        if not name.startswith("cm-"):
+            continue
+        try:
+            n = int(name.split("-")[1])
+        except (IndexError, ValueError):
+            continue
+
+        state = c.get("State", "unknown")
+        status = c.get("Status", "")
+        uptime, health = parse_status(status)
+        port = BASE_PORT + n
+        instances.append((n, name, state, uptime, health, port))
+
+    if not instances:
+        print("No CM instances found")
+        return 0
+
+    print(f"{'#':<4} {'Container':<12} {'Status':<12} {'Uptime':<16} {'Health':<12} {'Port':<8} {'SSH'}")
+    print("-" * 88)
+    for n, name, state, uptime, health, port in sorted(instances):
+        ssh_cmd = f"./cm ssh {n}" if state == "running" else "-"
+        print(f"{n:<4} {name:<12} {state:<12} {uptime:<16} {health:<12} {port:<8} {ssh_cmd}")
+
+    return 0
+
+
+def cmd_complete(args: argparse.Namespace) -> int:
+    """Fast instance completion for bash (internal command)."""
+    mode = args.mode
+    table = args.table
+
+    if mode == "instances":
+        if table:
+            # Need Docker API to get status for table display
+            client = get_client()
+            containers = client.api.containers(all=True, filters={"name": "cm-"})
+            instances = []
+            for c in containers:
+                names = c.get("Names", [])
+                if not names:
+                    continue
+                name = names[0].lstrip("/")
+                if name.startswith("cm-"):
+                    try:
+                        n = int(name.split("-")[1])
+                        status = c.get("State", "unknown")
+                        instances.append((n, name, status))
+                    except (IndexError, ValueError):
+                        pass
+            if instances:
+                print(f"{'#':<4} {'Container':<12} {'Status':<12}")
+                print("-" * 30)
+                for n, name, status in sorted(instances):
+                    print(f"{n:<4} {name:<12} {status:<12}")
+        else:
+            # Filesystem scan - instant
+            instances = []
+            for d in WORKSPACES_DIR.iterdir():
+                if d.is_dir() and d.name.startswith("cm."):
+                    try:
+                        n = int(d.name.split(".")[1])
+                        instances.append(n)
+                    except (IndexError, ValueError):
+                        pass
+            print(" ".join(str(n) for n in sorted(instances)))
+
+    elif mode == "running":
+        # Low-level Docker API
+        client = get_client()
+        containers = client.api.containers(
+            filters={"name": "cm-", "status": "running"}
+        )
+        instances = []
+        for c in containers:
+            names = c.get("Names", [])
+            if names:
+                name = names[0].lstrip("/")
+                if name.startswith("cm-"):
+                    try:
+                        n = int(name.split("-")[1])
+                        if table:
+                            status = c.get("State", "running")
+                            instances.append((n, name, status))
+                        else:
+                            instances.append(n)
+                    except (IndexError, ValueError):
+                        pass
+        if table:
+            if instances:
+                print(f"{'#':<4} {'Container':<12} {'Status':<12}")
+                print("-" * 30)
+                for n, name, status in sorted(instances):
+                    print(f"{n:<4} {name:<12} {status:<12}")
+        else:
+            print(" ".join(str(n) for n in sorted(instances)))
+
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    """Show logs for an instance."""
+    client = get_client()
+    cfg = get_instance_config(args.instance)
+
+    container = get_container(client, cfg["container"])
+    if not container:
+        print(f"Instance {args.instance} does not exist")
+        return 1
+
+    # Stream logs
+    try:
+        for line in container.logs(stream=True, follow=True):
+            print(line.decode("utf-8"), end="")
+    except KeyboardInterrupt:
+        print()
+
+    return 0
+
+
+def cmd_panes(args: argparse.Namespace) -> int:
+    """Open tmux session with SSH panes for instances."""
+    client = get_client()
+    instances = parse_instances(args.instances)
+
+    if not instances:
+        print("No instances specified")
+        return 1
+
+    # Check which instances are running
+    running = get_running_instances(client)
+    not_running = [n for n in instances if n not in running]
+    if not_running:
+        print(f"Warning: Instance(s) {', '.join(map(str, not_running))} not running")
+        instances = [n for n in instances if n in running]
+        if not instances:
+            print("No running instances to connect to")
+            return 1
+
+    session_name, existed = get_next_session_name()
+    if existed:
+        print(f"Warning: Existing session found, creating '{session_name}'")
+
+    # Create new session with first instance
+    first = instances[0]
+    run_tmux(["new-session", "-d", "-s", session_name, "-n", session_name], check=True)
+    run_tmux(["set-option", "-t", session_name, "set-titles", "on"], check=True)
+    run_tmux(["set-option", "-t", session_name, "set-titles-string", session_name], check=True)
+    run_tmux(["setw", "-t", session_name, "automatic-rename", "off"], check=True)
+    run_tmux(["send-keys", "-t", f"{session_name}:0.0",
+                    f"./cm ssh {first}", "Enter"], check=True)
+
+    # Split panes for remaining instances
+    for i, n in enumerate(instances[1:], start=1):
+        run_tmux(["split-window", "-t", session_name], check=True)
+        run_tmux(["send-keys", "-t", f"{session_name}:0.{i}",
+                        f"./cm ssh {n}", "Enter"], check=True)
+        # Rebalance layout after each split to prevent "no space for new pane"
+        run_tmux(["select-layout", "-t", session_name, "tiled"],
+                       check=True)
+
+    # Enable synchronized panes if requested
+    if args.sync:
+        run_tmux(["setw", "-t", session_name, "synchronize-panes", "on"],
+                       check=True)
+
+    # Switch or attach to session (replaces current process)
+    if os.environ.get("TMUX"):
+        exec_tmux(["switch-client", "-t", session_name])
+    else:
+        exec_tmux(["attach", "-t", session_name])
+
+
+def cmd_win(args: argparse.Namespace) -> int:
+    """Open tmux session with SSH windows for instances."""
+    client = get_client()
+    instances = parse_instances(args.instances)
+
+    if not instances:
+        print("No instances specified")
+        return 1
+
+    # Check which instances are running
+    running = get_running_instances(client)
+    not_running = [n for n in instances if n not in running]
+    if not_running:
+        print(f"Warning: Instance(s) {', '.join(map(str, not_running))} not running")
+        instances = [n for n in instances if n in running]
+        if not instances:
+            print("No running instances to connect to")
+            return 1
+
+    session_name, existed = get_next_session_name()
+    if existed:
+        print(f"Warning: Existing session found, creating '{session_name}'")
+
+    # Create new session with first window
+    first = instances[0]
+    window_name = f"{session_name}-w{first}"
+    run_tmux(["new-session", "-d", "-s", session_name,
+                    "-n", window_name], check=True)
+    run_tmux(["set-option", "-t", session_name, "set-titles", "on"], check=True)
+    run_tmux(["set-option", "-t", session_name, "set-titles-string", session_name], check=True)
+    run_tmux(["setw", "-t", session_name, "automatic-rename", "off"], check=True)
+    run_tmux(["send-keys", "-t", f"{session_name}:{window_name}",
+                    f"./cm ssh {first}", "Enter"], check=True)
+
+    # Create additional windows
+    for n in instances[1:]:
+        window_name = f"{session_name}-w{n}"
+        run_tmux(["new-window", "-t", f"{session_name}:",
+                        "-n", window_name], check=True)
+        run_tmux(["send-keys", "-t", f"{session_name}:{window_name}",
+                        f"./cm ssh {n}", "Enter"], check=True)
+
+    # Enable synchronized panes if requested
+    if args.sync:
+        run_tmux(["setw", "-t", session_name, "synchronize-panes", "on"],
+                       check=True)
+
+    # Switch or attach to session (replaces current process)
+    if os.environ.get("TMUX"):
+        exec_tmux(["switch-client", "-t", session_name])
+    else:
+        exec_tmux(["attach", "-t", session_name])
+
+
+def cmd_kill(args: argparse.Namespace) -> int:
+    """Kill cm tmux session(s)."""
+    # If specific sessions provided, kill them directly
+    if args.sessions:
+        for session in args.sessions:
+            result = run_tmux(["kill-session", "-t", session],
+                                    capture_output=True)
+            if result.returncode != 0:
+                print(f"Session '{session}' not found")
+            else:
+                print(f"Killed session '{session}'")
+        return 0
+
+    # No sessions specified - find all cm sessions
+    result = run_tmux(["list-sessions", "-F", "#{session_name}"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print("No tmux sessions found")
+        return 1
+
+    sessions = result.stdout.strip().split("\n")
+    cm_sessions = [s for s in sessions if s == "cm" or s.startswith("cm-")]
+
+    if not cm_sessions:
+        print("No cm sessions found")
+        return 1
+
+    # Prompt for confirmation
+    print(f"Sessions to kill: {', '.join(cm_sessions)}")
+    try:
+        response = input("Kill all? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 1
+
+    if response != "y":
+        print("Aborted")
+        return 1
+
+    for session in cm_sessions:
+        run_tmux(["kill-session", "-t", session], capture_output=True)
+        print(f"Killed session '{session}'")
+
+    return 0
+
+
+def cmd_broadcast(args: argparse.Namespace) -> int:
+    """Toggle synchronized input for tmux panes."""
+    state = "on" if args.state == "on" else "off"
+
+    # If specific sessions provided, use those
+    if args.sessions:
+        for session in args.sessions:
+            result = run_tmux(["has-session", "-t", session], capture_output=True)
+            if result.returncode != 0:
+                print(f"Session '{session}' not found")
+            else:
+                run_tmux(["setw", "-t", session, "synchronize-panes", state],
+                         check=True)
+                print(f"Broadcast {state} for '{session}'")
+        return 0
+
+    # No sessions specified - find all cm sessions
+    result = run_tmux(["list-sessions", "-F", "#{session_name}"],
+                      capture_output=True, text=True)
+    if result.returncode != 0:
+        print("No tmux sessions found")
+        return 1
+
+    sessions = result.stdout.strip().split("\n")
+    cm_sessions = [s for s in sessions if s == "cm" or s.startswith("cm-")]
+
+    if not cm_sessions:
+        print("No cm sessions found. Use './cm pan' or './cm win' first.")
+        return 1
+
+    for session in cm_sessions:
+        run_tmux(["setw", "-t", session, "synchronize-panes", state], check=True)
+        print(f"Broadcast {state} for '{session}'")
+
+    return 0
+
+
+def cmd_autocomplete(args: argparse.Namespace) -> int:
+    """Print bash completion script to stdout."""
+    script = '''\
+_cm_completions() {
+    local cur prev words cword
+    _init_completion || return
+
+    local commands="start stop restart ssh list logs pan win kill broadcast autocomplete"
+
+    if [[ $cword -eq 1 ]]; then
+        COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+        return
+    fi
+
+    local cmd="${words[1]}"
+
+    # Helper: filter out words already on command line
+    _filter_used() {
+        local item
+        for item; do
+            local used=0
+            local w
+            for w in "${words[@]}"; do
+                [[ "$w" == "$item" ]] && { used=1; break; }
+            done
+            [[ $used -eq 0 ]] && echo "$item"
+        done
+    }
+
+    # Helper: show formatted table and return numbers
+    _cm_complete_instances() {
+        local mode="$1"
+        local instances
+        instances=$(cm _complete "$mode" 2>/dev/null)
+        if [[ -z "$cur" && -n "$instances" ]]; then
+            echo >/dev/tty
+            cm _complete "$mode" --table 2>/dev/null >/dev/tty
+            printf '\n%s ' "${words[*]}" >/dev/tty
+        fi
+        echo "$instances"
+    }
+
+    case "$cmd" in
+        ssh|logs)
+            # Single instance number (running only)
+            local instances
+            instances=$(_cm_complete_instances running)
+            COMPREPLY=($(compgen -W "$instances" -- "$cur"))
+            ;;
+        start|pan|win)
+            # Multiple instance numbers (no duplicates)
+            local instances
+            instances=$(_cm_complete_instances instances)
+            COMPREPLY=($(compgen -W "$(_filter_used $instances)" -- "$cur"))
+            ;;
+        stop|restart)
+            # Multiple instance numbers plus "all" (no duplicates)
+            local instances
+            instances=$(_cm_complete_instances instances)
+            COMPREPLY=($(compgen -W "$(_filter_used $instances all)" -- "$cur"))
+            ;;
+        kill)
+            # Tmux session names (no duplicates)
+            local sessions
+            sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep -E '^cm(-|$)')
+            COMPREPLY=($(compgen -W "$(_filter_used $sessions)" -- "$cur"))
+            ;;
+        broadcast)
+            if [[ $cword -eq 2 ]]; then
+                # First arg: on or off
+                COMPREPLY=($(compgen -W "on off" -- "$cur"))
+            else
+                # Subsequent args: tmux session names (no duplicates)
+                local sessions
+                sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep -E '^cm(-|$)')
+                COMPREPLY=($(compgen -W "$(_filter_used $sessions)" -- "$cur"))
+            fi
+            ;;
+    esac
+}
+
+complete -F _cm_completions cm
+'''
+    print(script)
+    return 0
+
+
+def main() -> int:
+    # Handle internal completion command before argparse (hidden from help)
+    if len(sys.argv) >= 2 and sys.argv[1] == "_complete":
+        mode = sys.argv[2] if len(sys.argv) > 2 else "instances"
+        table = "--table" in sys.argv or "-t" in sys.argv
+        args = argparse.Namespace(mode=mode, table=table)
+        return cmd_complete(args)
+
+    parser = argparse.ArgumentParser(description="Manage CM instances")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # start
+    p_start = subparsers.add_parser("start", help="Start instance(s)")
+    p_start.add_argument("instances", nargs="+", metavar="N",
+                         help="Instance number(s): 1, 1-5, or 1 3 5")
+    p_start.set_defaults(func=cmd_start)
+
+    # stop
+    p_stop = subparsers.add_parser("stop", help="Stop instance(s)")
+    p_stop.add_argument("instances", nargs="+", metavar="N",
+                        help="Instance number(s): 1, 1-5, 1 3 5, or 'all'")
+    p_stop.set_defaults(func=cmd_stop)
+
+    # restart
+    p_restart = subparsers.add_parser("restart", help="Restart instance(s)")
+    p_restart.add_argument("instances", nargs="+", metavar="N",
+                           help="Instance number(s): 1, 1-5, 1 3 5, or 'all'")
+    p_restart.set_defaults(func=cmd_restart)
+
+    # ssh
+    p_ssh = subparsers.add_parser("ssh", help="SSH into an instance")
+    p_ssh.add_argument("instance", type=int, metavar="N",
+                       help="Instance number")
+    p_ssh.set_defaults(func=cmd_ssh)
+
+    # list
+    p_list = subparsers.add_parser("list", help="List all instances")
+    p_list.set_defaults(func=cmd_list)
+
+    # logs
+    p_logs = subparsers.add_parser("logs", help="Show logs for an instance")
+    p_logs.add_argument("instance", type=int, metavar="N",
+                        help="Instance number")
+    p_logs.set_defaults(func=cmd_logs)
+
+    # pan
+    p_panes = subparsers.add_parser("pan", help="Open tmux session with SSH panes")
+    p_panes.add_argument("instances", nargs="+", metavar="N",
+                         help="Instance number(s): 1, 1-5, or 1 3 5")
+    p_panes.add_argument("--sync", "-s", action="store_true",
+                         help="Enable synchronized input to all panes")
+    p_panes.set_defaults(func=cmd_panes)
+
+    # win
+    p_win = subparsers.add_parser("win", help="Open tmux session with SSH windows")
+    p_win.add_argument("instances", nargs="+", metavar="N",
+                       help="Instance number(s): 1, 1-5, or 1 3 5")
+    p_win.add_argument("--sync", "-s", action="store_true",
+                       help="Enable synchronized input to all windows")
+    p_win.set_defaults(func=cmd_win)
+
+    # kill
+    p_kill = subparsers.add_parser("kill", help="Kill cm tmux session(s)")
+    p_kill.add_argument("sessions", nargs="*", metavar="SESSION",
+                        help="Session name(s) to kill (default: all, with confirmation)")
+    p_kill.set_defaults(func=cmd_kill)
+
+    # broadcast
+    p_broadcast = subparsers.add_parser("broadcast", help="Toggle synchronized input to all panes")
+    p_broadcast.add_argument("state", choices=["on", "off"],
+                             help="Enable or disable broadcast mode")
+    p_broadcast.add_argument("sessions", nargs="*", metavar="SESSION",
+                             help="Session name(s) (default: all cm sessions)")
+    p_broadcast.set_defaults(func=cmd_broadcast)
+
+    # autocomplete
+    p_autocomplete = subparsers.add_parser("autocomplete", help="Print bash completion script")
+    p_autocomplete.set_defaults(func=cmd_autocomplete)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

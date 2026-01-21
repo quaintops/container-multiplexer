@@ -1,0 +1,28 @@
+FROM debian:latest
+
+RUN apt-get update && apt-get upgrade -y
+
+RUN apt-get install -y \
+    vim \
+    openssh-server \
+    curl \
+    sudo
+
+
+# Create "me" user with sudo access
+RUN useradd -m -s /bin/bash me && \
+    echo "me ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Configure SSH
+RUN mkdir -p /var/run/sshd && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config && \
+    sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
+    rm -f /etc/motd && \
+    sed -i 's/^session.*pam_motd/#&/' /etc/pam.d/sshd
+
+# Setup SSH directory for me user
+RUN mkdir -p /home/me/.ssh && \
+    chmod 700 /home/me/.ssh && \
+    chown me:me /home/me/.ssh
+
+USER root
